@@ -4,6 +4,7 @@ The main intention is to use it for batch processing of TRAK simulations.
 """
 
 import os
+import time
 from multiprocessing.connection import Listener, Client
 from threading import Thread
 from queue import Queue
@@ -40,17 +41,17 @@ def submit_qjobs(jobs, address=ADDRESS):
     with Client(address, authkey=AUTHKEY) as con:
         con.send([job.serialise() for job in jobs])
 
-class ListenerDaemon(Thread):
+class QListenerDaemon(Thread):
     """
     A deamon thread running in the background waiting for connection attempts in order to submit
     jobs to the server. Can only handle one connection at a time. Times out if a connections is
     opened but no data received.
     """
-    def __init__(self, address, queue, logger=None):
+    def __init__(self, address, jobqueue, logger=None):
         super().__init__()
         self.daemon = True
         self.address = address
-        self.queue = queue
+        self.jobqueue = jobqueue
         self.logger = logger or start_logger()
 
     def run(self):
@@ -70,7 +71,7 @@ class ListenerDaemon(Thread):
             for job in jobs:
                 try:
                     job = QJob.deserialise(job)
-                    self.queue.put(job)
+                    self.jobqueue.put(job)
                 except ValueError as err:
                     misses += 1
                     self.logger.error("Received some data that is not a valid QJob.")
@@ -151,6 +152,7 @@ class QJob:
         return self._tasks[self._task_counter]
 
     def cancel_active_task(self):
+        """Cancels the active task"""
         if not self._active:
             raise Exception("Cancelled task while job was not active.")
         if self._finished:
@@ -192,7 +194,7 @@ class QServer:
         self.address = address
         self.logger = start_logger(logfile=SERVERLOG, name="QS")
         self.queue = Queue()
-        self.listener = ListenerDaemon(self.address, self.queue, logger=logging.getLogger("QS.LD"))
+        self.listener = QListenerDaemon(self.address, self.queue, logger=logging.getLogger("QS.LD"))
 
     def start(self):
         """Starts the server and the required components"""
@@ -200,8 +202,62 @@ class QServer:
         self.logger.info("Starting listener daemon.")
         self.listener.start()
         while True:
-            pass
+            entry_time = time.time()
+            # Limit loop speed to 10Hz
+            time.sleep(max(0, .1-(time.time()-entry_time)))
 
+class QManager(Thread):
+    """Manager for the individual workers"""
+    INSTR_STOP = 0
+    # INSTR_ADD_WORKER = 1
+    # INSTR_REM_WORKER = 2
+    INSTR_SET_WORKERS = 3
+    INSTR_KILL_WORKER = 4
+    def __init__(self, jobqueue, instructionqueue):
+        super().__init__()
+        self.jobqueue = jobqueue
+        self.instructionqueue = instructionqueue
+        self.workereventqueue = Queue()
+        self.logger = start_logger(logfile=SERVERLOG, name="QS.QM")
+        self.worker_target = os.cpu_count()
+        self.logger.info("Set target number of workers to %d.", self.worker_target)
+        self.workers = []
+
+    def run(self):
+        while True:
+            entry_time = time.time()
+            if not self.instructionqueue.empty():
+                instr = self.instructionqueue.get()
+                instr_code = instr[0]
+                instr_args = instr[1]
+                if instr_code == QManager.INSTR_STOP:
+                    self.logger.info("Breaking from QManager.")
+                    break
+                if instr_code == QManager.INSTR_SET_WORKERS:
+                    self.worker_target = instr_args
+                    self.logger.info("Set target number of workers to %d.", self.worker_target)
+                if instr_code == QManager.INSTR_KILL_WORKER:
+                    raise NotImplementedError
+            if not self.workereventqueue.empty():
+                pass
+            # Limit loop speed to 10Hz
+            time.sleep(max(0, .1-(time.time()-entry_time)))
+
+    def _get_free_id(self):
+        return min(set(range(len(self.target_workers)))-set([w.idx for w in self.workers]))
+
+
+
+class QWorker(Thread):
+    """Worker thread"""
+    EVENT_SUCCESS = 0
+    EVENT_FAIL = 1
+    def __init__(self, idx, workereventqueue):
+        super().__init__()
+        self.idx = idx
+        self.workereventqueue = workereventqueue
+        self.logger = start_logger(logfile=SERVERLOG, name="QS.W"+str(idx))
+        self.running = True
 
 def main():
     """
