@@ -139,16 +139,25 @@ class QJob:
         """Add a task to this job (appended at the end)"""
         self._tasks.append(task)
 
-    def grab_next_task(self):
+    def get_next_task(self):
         """Grab a task and mark the job as active"""
         if self._active:
-            raise Exception("Grabbed task while job is active.")
+            raise Exception("Requested task while job is active.")
         if self._finished:
-            raise Exception("Grabbed task after job has finished.")
+            raise Exception("Requested task after job has finished.")
         if self._crashed:
-            raise Exception("Grabbed task after job has crashed.")
+            raise Exception("Requested task after job has crashed.")
         self._active = True
         return self._tasks[self._task_counter]
+
+    def cancel_active_task(self):
+        if not self._active:
+            raise Exception("Cancelled task while job was not active.")
+        if self._finished:
+            raise Exception("Cancelled task after job has finished.")
+        if self._crashed:
+            raise Exception("Cancelled task after job has crashed.")
+        self._active = False
 
     def report_success(self):
         """Mark current job as succesfull and mark the job as inactive"""
@@ -172,6 +181,7 @@ class QJob:
             raise Exception("Reported crash after job has finished.")
         if self._crashed:
             raise Exception("Reported crash after job has crashed.")
+        self._active = False
         self._crashed = True
 
 class QServer:
