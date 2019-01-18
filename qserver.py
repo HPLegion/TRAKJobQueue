@@ -69,7 +69,7 @@ class ListenerDaemon(Thread):
             misses = 0
             for job in jobs:
                 try:
-                    job = QJob.from_serialised(job)
+                    job = QJob.deserialise(job)
                     self.queue.put(job)
                 except ValueError as err:
                     misses += 1
@@ -100,7 +100,7 @@ class QJob:
         return (str(self.__class__), self.__dict__.copy())
 
     @staticmethod
-    def from_serialised(serialised_qjob):
+    def deserialise(serialised_qjob):
         """Recreates a job from a serialisation acquired by serialise method"""
         if "QJob" in serialised_qjob[0]:
             job = QJob()
