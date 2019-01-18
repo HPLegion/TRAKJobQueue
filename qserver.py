@@ -9,12 +9,14 @@ from threading import Thread
 from queue import Queue
 import logging
 
+# General module/script settings
 ADDRESS = ("localhost", 6000)
+AUTHKEY = os.environ["QSERVERPASS"].encode()
 LOGFORMAT = "[%(asctime)s][%(name)s][%(levelname)s]:%(message)s"
 SERVERLOG = "./server.log"
-AUTHKEY = os.environ["QSERVERPASS"].encode()
+LOGLEVEL = logging.debug
 
-def start_logger(logfile=None, name=None, log_level=logging.INFO):
+def start_logger(logfile=None, name=None, log_level=LOGLEVEL):
     """
     Starts a logger
     """
@@ -29,12 +31,14 @@ def start_logger(logfile=None, name=None, log_level=logging.INFO):
         logger.addHandler(logger_file_handler)
     return logger
 
-def submit(jobs, address=ADDRESS):
+def submit_qjobs(jobs, address=ADDRESS):
     """
     Submits a list of objects of type QJob to the server under the given address
     """
+    if not isinstance(jobs, list):
+        jobs = [jobs]
     with Client(address, authkey=AUTHKEY) as con:
-        con.send(jobs)
+        con.send([job.serialise() for job in jobs])
 
 class ListenerDaemon(Thread):
     """
@@ -64,11 +68,14 @@ class ListenerDaemon(Thread):
             self.logger.info("Received data from %s.", client)
             misses = 0
             for job in jobs:
-                if isinstance(job, QJob):
+                try:
+                    job = QJob.from_serialised(job)
                     self.queue.put(job)
-                else:
+                except ValueError as err:
                     misses += 1
-                    self.logger.error("Received some data that is not of type QJob.")
+                    self.logger.error("Received some data that is not a valid QJob.")
+                    self.logger.debug(err)
+                    self.logger.debug(str(job))
             self.logger.info("Queued %d new job(s).", len(jobs)-misses)
             if misses > 0:
                 self.logger.info("Discarded %d chunk(s) of useless received data.", misses)
@@ -80,7 +87,92 @@ class QJob:
     The class defining a job object which includes the necessary instructions and parameters for
     the tasks within this job to be performed
     """
-    pass
+    def __init__(self, name=""):
+        self.name = name
+        self._tasks = []
+        self._task_counter = 0
+        self._active = False
+        self._finished = False
+        self._crashed = False
+
+    def serialise(self):
+        """Very basic serialisation of the object by returning class name and dict content"""
+        return (str(self.__class__), self.__dict__.copy())
+
+    @staticmethod
+    def from_serialised(serialised_qjob):
+        """Recreates a job from a serialisation acquired by serialise method"""
+        if "QJob" in serialised_qjob[0]:
+            job = QJob()
+            for key, val in serialised_qjob[1].items():
+                job.__setattr__(key, val)
+            return job
+        else:
+            raise ValueError("Not a valid QJob serialisation")
+
+    @property
+    def num_tasks(self):
+        """Total number of tasks within the job"""
+        return len(self._tasks)
+
+    @property
+    def current_task(self):
+        """Returns the number of the current task (as 1-indexed)"""
+        return self._task_counter + 1
+
+    @property
+    def active(self):
+        """Reports whether the job is currently active"""
+        return self._active
+
+    @property
+    def finished(self):
+        """Reports whether the job has finished"""
+        return self._finished
+
+    @property
+    def crashed(self):
+        """Reports whether the job has crashed"""
+        return self._crashed
+
+    def add_task(self, task):
+        """Add a task to this job (appended at the end)"""
+        self._tasks.append(task)
+
+    def grab_next_task(self):
+        """Grab a task and mark the job as active"""
+        if self._active:
+            raise Exception("Grabbed task while job is active.")
+        if self._finished:
+            raise Exception("Grabbed task after job has finished.")
+        if self._crashed:
+            raise Exception("Grabbed task after job has crashed.")
+        self._active = True
+        return self._tasks[self._task_counter]
+
+    def report_success(self):
+        """Mark current job as succesfull and mark the job as inactive"""
+        if not self._active:
+            raise Exception("Reported success while job was not active.")
+        if self._finished:
+            raise Exception("Reported success after job has finished.")
+        if self._crashed:
+            raise Exception("Reported success after job has crashed.")
+        self._active = False
+        if self._task_counter == self.num_tasks:
+            self._finished = True
+        else:
+            self._task_counter += 1
+
+    def report_crash(self):
+        """Report that the current task/job has crashed"""
+        if not self._active:
+            raise Exception("Reported crash while job was not active.")
+        if self._finished:
+            raise Exception("Reported crash after job has finished.")
+        if self._crashed:
+            raise Exception("Reported crash after job has crashed.")
+        self._crashed = True
 
 class QServer:
     """
