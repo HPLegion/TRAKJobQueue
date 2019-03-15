@@ -345,14 +345,14 @@ class QWorker(Thread):
                     if attempts < 2:
                         job.cancel_active_task()
                         attempts += 1
-                        self.logger.info(
+                        self.logger.warning(
                             "Task %d/%d crashed, will reattempt. - %s",
                             job.current_task, job.num_tasks, str(res)
                         )
-                        time.sleep(1) # Sleep some time to debunch file access attempts
+                        time.sleep(3.1415926535 * int(self.idx)) # Sleep some time to debunch file access attempts
                     else:
                         job.report_crash()
-                        self.logger.info(
+                        self.logger.error(
                             "Task %d/%d crashed repeatedly, aborting job %s. - %s",
                             job.current_task, job.num_tasks, job.name, str(res)
                         )
