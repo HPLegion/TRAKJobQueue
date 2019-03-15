@@ -198,8 +198,12 @@ class QServer:
         self.logger = start_logger(logfile=SERVERLOG, name="QS")
         self.jobqueue = Queue()
         self.instructionqueue = Queue()
-        self.listener = QListenerDaemon(self.address, self.jobqueue, logger=logging.getLogger("QS.LD"))
-        self.manager = QManager(self.jobqueue, self.instructionqueue, logger=logging.getLogger("QS.QM"))
+        self.listener = QListenerDaemon(
+            self.address, self.jobqueue, logger=logging.getLogger("QS.LD")
+        )
+        self.manager = QManager(
+            self.jobqueue, self.instructionqueue, logger=logging.getLogger("QS.QM")
+        )
 
     def start(self):
         """Starts the server and the required components"""
@@ -209,19 +213,26 @@ class QServer:
         self.logger.info("Starting manager.")
         self.manager.start()
         while True:
-            ui = input()
-            ui = ui.lower()
-            if ui[0] == "s":
+            inp = input()
+            inp = inp.lower()
+            if inp[0:3] == "set":
                 try:
-                    num = int(ui[1:])
+                    num = int(inp[3:])
                     self.instructionqueue.put((QManager.INSTR_SET_WORKERS, num))
                 except ValueError:
-                    print("Invalid input: %s"%ui)
-            if ui == "exit":
+                    print("Invalid input: %s, could not parse number of workers"%inp)
+            elif inp == "exit":
+                self.logger.info("Inititating shutdown.")
                 self.instructionqueue.put((QManager.INSTR_STOP, 0))
                 break
+            elif inp == "status":
+                print("Currently running workers: %d, goal : %d"%
+                    (len(self.manager.workers), self.manager.worker_target)
+                )
+                for w in self.manager.workers:
+                    print(w.name, "-", w.jobname, ("(Poisoned)" if w.poisoned else ""))
             else:
-                print("Invalid input: %s"%ui)
+                print("Invalid input: %s"%inp)
         self.manager.join()
         self.logger.info("Shutting down.")
 
@@ -282,7 +293,7 @@ class QManager(Thread):
             # Clean up dead workers
             self.workers = [w for w in self.workers if w.is_alive()]
 
-            if self.shutdown_triggered and len(self.workers) == 0:
+            if self.shutdown_triggered and not self.workers:
                 self.logger.info("Shutting down.")
                 break
             # Limit loop speed to 10Hz
@@ -300,10 +311,11 @@ class QWorker(Thread):
     def __init__(self, idx, jobqueue, workereventqueue):
         super().__init__()
         self.idx = idx
+        self.name = "W" + str(self.idx)
         self.workereventqueue = workereventqueue
         self.jobqueue = jobqueue
-        self.logger = logging.getLogger("QS.W"+str(idx))
-        self.running = True
+        self.logger = logging.getLogger("QS."+self.name)
+        self.jobname = "Idle"
         self.poisoned = False
 
     def run(self):
@@ -311,19 +323,41 @@ class QWorker(Thread):
         while not self.poisoned:
             try:
                 job = self.jobqueue.get(timeout=0.1)
+                self.jobname = job.name
             except Empty:
                 continue
             self.logger.info("Grabbed job: %s", job.name)
-            while not job.finished:
+            attempts = 0
+            while not job.finished and not job.crashed:
                 task = job.get_next_task()
                 self.logger.info(
                     "Start working on task %d/%d - %s",
                     job.current_task, job.num_tasks, str(task)
                 )
                 res = subprocess.run(**task)
-                job.report_success()
-                self.logger.info("Finished task %d/%d - %s", job.current_task, job.num_tasks, str(res))
+                if res.returncode == 0:
+                    attempts = 0
+                    job.report_success()
+                    self.logger.info(
+                        "Finished task %d/%d - %s", job.current_task, job.num_tasks, str(res)
+                    )
+                else:
+                    if attempts < 2:
+                        job.cancel_active_task()
+                        attempts += 1
+                        self.logger.info(
+                            "Task %d/%d crashed, will reattempt. - %s",
+                            job.current_task, job.num_tasks, str(res)
+                        )
+                        time.sleep(1) # Sleep some time to debunch file access attempts
+                    else:
+                        job.report_crash()
+                        self.logger.info(
+                            "Task %d/%d crashed repeatedly, aborting job %s. - %s",
+                            job.current_task, job.num_tasks, job.name, str(res)
+                        )
             self.logger.info("Finished job: %s", job.name)
+            self.jobname = "Idle"
         self.logger.info("Dying.")
 
 
