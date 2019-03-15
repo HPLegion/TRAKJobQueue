@@ -7,15 +7,16 @@ import os
 import time
 from multiprocessing.connection import Listener, Client
 from threading import Thread
-from queue import Queue
+from queue import Queue, Empty
 import logging
+import subprocess
 
 # General module/script settings
 ADDRESS = ("localhost", 6000)
 AUTHKEY = os.environ["QSERVERPASS"].encode()
 LOGFORMAT = "[%(asctime)s][%(name)s][%(levelname)s]:%(message)s"
 SERVERLOG = "./server.log"
-LOGLEVEL = logging.debug
+LOGLEVEL = logging.DEBUG
 
 def start_logger(logfile=None, name=None, log_level=LOGLEVEL):
     """
@@ -55,6 +56,7 @@ class QListenerDaemon(Thread):
         self.logger = logger or start_logger()
 
     def run(self):
+        self.logger.info("Running.")
         with Listener(address=self.address, authkey=AUTHKEY) as listener:
             while True:
                 self.logger.info("Listening for incoming connection...")
@@ -71,6 +73,7 @@ class QListenerDaemon(Thread):
             for job in jobs:
                 try:
                     job = QJob.deserialise(job)
+                    self.logger.info("Received job %s", job.name)
                     self.jobqueue.put(job)
                 except ValueError as err:
                     misses += 1
@@ -170,7 +173,7 @@ class QJob:
         if self._crashed:
             raise Exception("Reported success after job has crashed.")
         self._active = False
-        if self._task_counter == self.num_tasks:
+        if self._task_counter + 1 == self.num_tasks:
             self._finished = True
         else:
             self._task_counter += 1
@@ -193,18 +196,35 @@ class QServer:
     def __init__(self, address=ADDRESS):
         self.address = address
         self.logger = start_logger(logfile=SERVERLOG, name="QS")
-        self.queue = Queue()
-        self.listener = QListenerDaemon(self.address, self.queue, logger=logging.getLogger("QS.LD"))
+        self.jobqueue = Queue()
+        self.instructionqueue = Queue()
+        self.listener = QListenerDaemon(self.address, self.jobqueue, logger=logging.getLogger("QS.LD"))
+        self.manager = QManager(self.jobqueue, self.instructionqueue, logger=logging.getLogger("QS.QM"))
 
     def start(self):
         """Starts the server and the required components"""
-        self.logger.info("Starting server.")
+        self.logger.info("Running.")
         self.logger.info("Starting listener daemon.")
         self.listener.start()
+        self.logger.info("Starting manager.")
+        self.manager.start()
         while True:
-            entry_time = time.time()
-            # Limit loop speed to 10Hz
-            time.sleep(max(0, .1-(time.time()-entry_time)))
+            ui = input()
+            ui = ui.lower()
+            if ui[0] == "s":
+                try:
+                    num = int(ui[1:])
+                    self.instructionqueue.put((QManager.INSTR_SET_WORKERS, num))
+                except ValueError:
+                    print("Invalid input: %s"%ui)
+            if ui == "exit":
+                self.instructionqueue.put((QManager.INSTR_STOP, 0))
+                break
+            else:
+                print("Invalid input: %s"%ui)
+        self.manager.join()
+        self.logger.info("Shutting down.")
+
 
 class QManager(Thread):
     """Manager for the individual workers"""
@@ -212,18 +232,20 @@ class QManager(Thread):
     # INSTR_ADD_WORKER = 1
     # INSTR_REM_WORKER = 2
     INSTR_SET_WORKERS = 3
-    INSTR_KILL_WORKER = 4
-    def __init__(self, jobqueue, instructionqueue):
+    # INSTR_KILL_WORKER = 4
+    def __init__(self, jobqueue, instructionqueue, logger=None):
         super().__init__()
         self.jobqueue = jobqueue
         self.instructionqueue = instructionqueue
         self.workereventqueue = Queue()
-        self.logger = start_logger(logfile=SERVERLOG, name="QS.QM")
+        self.logger = logger or start_logger()
         self.worker_target = os.cpu_count()
-        self.logger.info("Set target number of workers to %d.", self.worker_target)
         self.workers = []
+        self.shutdown_triggered = False
 
     def run(self):
+        self.logger.info("Running.")
+        self.logger.info("Set target number of workers to %d.", self.worker_target)
         while True:
             entry_time = time.time()
             if not self.instructionqueue.empty():
@@ -231,20 +253,43 @@ class QManager(Thread):
                 instr_code = instr[0]
                 instr_args = instr[1]
                 if instr_code == QManager.INSTR_STOP:
-                    self.logger.info("Breaking from QManager.")
-                    break
+                    self.logger.info("Gracefully shutting down. Waiting for workers to die.")
+                    self.shutdown_triggered = True
+                    self.worker_target = 0
                 if instr_code == QManager.INSTR_SET_WORKERS:
                     self.worker_target = instr_args
                     self.logger.info("Set target number of workers to %d.", self.worker_target)
-                if instr_code == QManager.INSTR_KILL_WORKER:
-                    raise NotImplementedError
-            if not self.workereventqueue.empty():
-                pass
+            #     if instr_code == QManager.INSTR_KILL_WORKER:
+            #         raise NotImplementedError
+
+            # if not self.workereventqueue.empty():
+            #     pass
+
+            # Add workers if necessary
+            while len(self.workers) < self.worker_target:
+                worker = QWorker(self._get_free_id(), self.jobqueue, self.workereventqueue)
+                self.logger.info("Starting worker #%d", worker.idx)
+                worker.start()
+                self.workers.append(worker)
+
+            # Poisson workers if necessary
+            unpoisoned = [w for w in self.workers if not w.poisoned]
+            while len(unpoisoned) > self.worker_target:
+                worker = unpoisoned.pop(-1)
+                self.logger.info("Poisoning worker #%d", worker.idx)
+                worker.poisoned = True
+
+            # Clean up dead workers
+            self.workers = [w for w in self.workers if w.is_alive()]
+
+            if self.shutdown_triggered and len(self.workers) == 0:
+                self.logger.info("Shutting down.")
+                break
             # Limit loop speed to 10Hz
             time.sleep(max(0, .1-(time.time()-entry_time)))
 
     def _get_free_id(self):
-        return min(set(range(len(self.target_workers)))-set([w.idx for w in self.workers]))
+        return min(set(range(self.worker_target)) - set(w.idx for w in self.workers))
 
 
 
@@ -252,12 +297,36 @@ class QWorker(Thread):
     """Worker thread"""
     EVENT_SUCCESS = 0
     EVENT_FAIL = 1
-    def __init__(self, idx, workereventqueue):
+    def __init__(self, idx, jobqueue, workereventqueue):
         super().__init__()
         self.idx = idx
         self.workereventqueue = workereventqueue
-        self.logger = start_logger(logfile=SERVERLOG, name="QS.W"+str(idx))
+        self.jobqueue = jobqueue
+        self.logger = logging.getLogger("QS.W"+str(idx))
         self.running = True
+        self.poisoned = False
+
+    def run(self):
+        self.logger.info("Running.")
+        while not self.poisoned:
+            try:
+                job = self.jobqueue.get(timeout=0.1)
+            except Empty:
+                continue
+            self.logger.info("Grabbed job: %s", job.name)
+            while not job.finished:
+                task = job.get_next_task()
+                self.logger.info(
+                    "Start working on task %d/%d - %s",
+                    job.current_task, job.num_tasks, str(task)
+                )
+                res = subprocess.run(**task)
+                job.report_success()
+                self.logger.info("Finished task %d/%d - %s", job.current_task, job.num_tasks, str(res))
+            self.logger.info("Finished job: %s", job.name)
+        self.logger.info("Dying.")
+
+
 
 def main():
     """
